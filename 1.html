@@ -1,0 +1,898 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>高空坠落 · 冲压翼伞 · osu! 挂坠</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #7db6e8; }
+  canvas { display: block; }
+  #hint {
+    position: fixed; left: 20px; bottom: 20px; pointer-events: none;
+    color: rgba(255,255,255,.92); font: 13px/1.6 system-ui, -apple-system, "PingFang SC", sans-serif;
+    user-select: none; letter-spacing: .04em;
+    text-shadow: 0 1px 6px rgba(0,30,70,.6);
+  }
+  #resetBtn {
+    position: fixed; right: 24px; bottom: 24px;
+    padding: 13px 32px;
+    font: 600 15px/1 system-ui, -apple-system, "PingFang SC", sans-serif;
+    color: #fff; letter-spacing: .08em;
+    background: linear-gradient(135deg, #4aadff, #1a6fd4);
+    border: none; border-radius: 11px; cursor: pointer;
+    box-shadow: 0 6px 22px rgba(20, 100, 210, .5), inset 0 1px 0 rgba(255,255,255,.35);
+    transition: transform .18s ease, box-shadow .18s ease;
+    z-index: 10;
+  }
+  #resetBtn:hover { transform: translateY(-2px); box-shadow: 0 10px 30px rgba(20, 100, 210, .65), inset 0 1px 0 rgba(255,255,255,.35); }
+  #resetBtn:active { transform: translateY(0); }
+  #status {
+    position: fixed; left: 20px; top: 18px;
+    padding: 8px 16px; border-radius: 8px;
+    color: #eaf4ff; font: 600 13px/1.4 system-ui, sans-serif;
+    background: rgba(10, 30, 60, .35); backdrop-filter: blur(8px);
+    letter-spacing: .06em; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.15);
+  }
+</style>
+</head>
+<body>
+<div id="status">高度：2800 m</div>
+<div id="hint">鼠标拖拽旋转 · 滚轮缩放 · 右键平移</div>
+<button id="resetBtn">重 置</button>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+/* =====================================================================
+   工具
+   ===================================================================== */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function makeNoise2D(seed) {
+  const rand = mulberry32(seed);
+  const p = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) p[i] = i;
+  for (let i = 255; i > 0; i--) { const j = Math.floor(rand() * (i + 1)); const t = p[i]; p[i] = p[j]; p[j] = t; }
+  const perm = new Uint8Array(512);
+  for (let i = 0; i < 512; i++) perm[i] = p[i & 255];
+  const fade = t => t * t * t * (t * (t * 6 - 15) + 10);
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const grad = (h, x, y) => {
+    const hh = h & 3;
+    const u = hh < 2 ? x : y;
+    const v = hh < 2 ? y : x;
+    return ((hh & 1) ? -u : u) + ((hh & 2) ? -v : v);
+  };
+  return function (x, y) {
+    const X = Math.floor(x) & 255, Y = Math.floor(y) & 255;
+    const xf = x - Math.floor(x), yf = y - Math.floor(y);
+    const u = fade(xf), v = fade(yf);
+    const aa = perm[perm[X] + Y], ab = perm[perm[X] + Y + 1];
+    const ba = perm[perm[X + 1] + Y], bb = perm[perm[X + 1] + Y + 1];
+    return lerp(
+      lerp(grad(aa, xf, yf), grad(ba, xf - 1, yf), u),
+      lerp(grad(ab, xf, yf - 1), grad(bb, xf - 1, yf - 1), u),
+      v
+    );
+  };
+}
+
+function fbm(noise, x, y, oct = 4, lac = 2.0, gain = 0.5) {
+  let a = 1, f = 1, s = 0, n = 0;
+  for (let i = 0; i < oct; i++) { s += a * noise(x * f, y * f); n += a; a *= gain; f *= lac; }
+  return s / n;
+}
+
+const smoothstep = (e0, e1, x) => {
+  const t = Math.max(0, Math.min(1, (x - e0) / (e1 - e0)));
+  return t * t * (3 - 2 * t);
+};
+
+/* =====================================================================
+   方向
+   ===================================================================== */
+const SUN_DIR = new THREE.Vector3(-0.48, 0.62, 0.62).normalize();
+const VISUAL_SUN_DIR = new THREE.Vector3(-0.50, 0.14, -0.85).normalize();
+
+/* =====================================================================
+   天空纹理（深蓝清透 + 高亮太阳 + 少量薄云）
+   ===================================================================== */
+function createSkyTexture(sunDirVisual) {
+  const W = 4096, H = 2048;
+  const cv = document.createElement('canvas');
+  cv.width = W; cv.height = H;
+  const ctx = cv.getContext('2d');
+
+  // 更饱和的蓝天渐变
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0.00, '#0b4fb2');
+  g.addColorStop(0.12, '#1d6fd0');
+  g.addColorStop(0.26, '#4a9de8');
+  g.addColorStop(0.38, '#8dc8f4');
+  g.addColorStop(0.46, '#c6e8fb');
+  g.addColorStop(0.50, '#e2f4fe');
+  g.addColorStop(0.54, '#c4e5f8');
+  g.addColorStop(0.64, '#9ecff0');
+  g.addColorStop(1.00, '#83b3d4');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  const lat = Math.asin(sunDirVisual.y);
+  let phi = Math.atan2(sunDirVisual.z, -sunDirVisual.x);
+  if (phi < 0) phi += Math.PI * 2;
+  const sunX = (phi / (Math.PI * 2)) * W;
+  const sunY = (1 - (0.5 + lat / Math.PI)) * H;
+
+  // 大范围暖光晕
+  const halo = ctx.createRadialGradient(sunX, sunY, 0, sunX, sunY, 1500);
+  halo.addColorStop(0.00, 'rgba(255,252,232,0.92)');
+  halo.addColorStop(0.07, 'rgba(255,247,205,0.52)');
+  halo.addColorStop(0.20, 'rgba(255,240,180,0.22)');
+  halo.addColorStop(0.52, 'rgba(255,235,170,0.06)');
+  halo.addColorStop(1.00, 'rgba(255,230,160,0)');
+  ctx.fillStyle = halo;
+  ctx.beginPath(); ctx.arc(sunX, sunY, 1500, 0, Math.PI * 2); ctx.fill();
+
+  // 太阳核心
+  const core = ctx.createRadialGradient(sunX, sunY, 0, sunX, sunY, 140);
+  core.addColorStop(0.00, 'rgba(255,255,255,1)');
+  core.addColorStop(0.35, 'rgba(255,255,250,0.98)');
+  core.addColorStop(0.70, 'rgba(255,253,228,0.70)');
+  core.addColorStop(1.00, 'rgba(255,246,192,0)');
+  ctx.fillStyle = core;
+  ctx.beginPath(); ctx.arc(sunX, sunY, 140, 0, Math.PI * 2); ctx.fill();
+
+  // 薄云（数量更少、alpha 更低）
+  let seed = 81123;
+  const rnd = () => { seed = (seed * 1664525 + 1013904223) % 4294967296; return seed / 4294967296; };
+
+  const puff = (cx, cy, sc, a) => {
+    const parts = [
+      [-1.00, 0.15, 0.95], [-0.55, -0.14, 1.12], [0.02, -0.30, 1.24],
+      [0.60, -0.10, 1.00], [1.15, 0.20, 0.78], [0.28, 0.38, 1.02], [-0.60, 0.40, 0.82]
+    ];
+    for (const [dx, dy, r] of parts) {
+      const rad = r * sc;
+      const x = cx + dx * sc, y = cy + dy * sc;
+      const rg = ctx.createRadialGradient(x, y, rad * 0.12, x, y, rad);
+      rg.addColorStop(0.00, `rgba(255,255,252,${a})`);
+      rg.addColorStop(0.50, `rgba(255,255,250,${a * 0.45})`);
+      rg.addColorStop(1.00, 'rgba(255,255,248,0)');
+      ctx.fillStyle = rg;
+      ctx.beginPath(); ctx.arc(x, y, rad, 0, Math.PI * 2); ctx.fill();
+    }
+  };
+
+  const bands = [
+    { y: 330, n: 5, s: [80, 150], a: 0.24 },
+    { y: 430, n: 4, s: [110, 200], a: 0.32 },
+    { y: 510, n: 3, s: [90, 160], a: 0.20 }
+  ];
+  for (const b of bands) {
+    for (let i = 0; i < b.n; i++) {
+      const bx = rnd() * W;
+      const by = b.y + (rnd() - 0.5) * 100;
+      const sc = b.s[0] + rnd() * (b.s[1] - b.s[0]);
+      const a = b.a * (0.7 + rnd() * 0.4);
+      for (const off of [-W, 0, W]) puff(bx + off, by, sc, a);
+    }
+  }
+
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.anisotropy = 8;
+  return tex;
+}
+
+/* =====================================================================
+   地形 + 河流（更饱和的绿色分层）
+   ===================================================================== */
+function buildTerrainAndRiver() {
+  const SIZE = 6000, SEG = 300;
+  const STEP = SIZE / SEG;
+  const noise = makeNoise2D(42317);
+
+  const riverCtrl = [
+    new THREE.Vector3(-2200, 0, 900),
+    new THREE.Vector3(-1300, 0, 300),
+    new THREE.Vector3(-520, 0, -420),
+    new THREE.Vector3(280, 0, 220),
+    new THREE.Vector3(1100, 0, -380),
+    new THREE.Vector3(2100, 0, 780)
+  ];
+  const riverCurve = new THREE.CatmullRomCurve3(riverCtrl);
+  const RS = 400;
+  const riverSamples = riverCurve.getPoints(RS);
+
+  const geo = new THREE.PlaneGeometry(SIZE, SIZE, SEG, SEG);
+  geo.rotateX(-Math.PI / 2);
+  const posAttr = geo.attributes.position;
+  const N = posAttr.count;
+  const heights = new Float32Array(N);
+
+  for (let i = 0; i < N; i++) {
+    const x = posAttr.getX(i), z = posAttr.getZ(i);
+    const dist = Math.sqrt(x * x + z * z);
+
+    const hill = (fbm(noise, x * 0.0010, z * 0.0010, 3) * 0.5 + 0.5) * 72;
+    const mid = (fbm(noise, x * 0.0028, z * 0.0028, 2) * 0.5 + 0.5) * 10;
+
+    const mMask = smoothstep(900, 2500, dist);
+    const mBase = (fbm(noise, x * 0.00040, z * 0.00040, 3) * 0.5 + 0.5) * 520;
+    const ridge = Math.pow(1 - Math.abs(fbm(noise, x * 0.00070, z * 0.00070, 2)), 2.2) * 300;
+    const mountain = (mBase + ridge) * mMask;
+
+    heights[i] = -230 + hill + mid + mountain;
+  }
+
+  const sampleH = (x, z) => {
+    const ix = Math.max(0, Math.min(SEG, Math.round((x + SIZE / 2) / STEP)));
+    const iz = Math.max(0, Math.min(SEG, Math.round((z + SIZE / 2) / STEP)));
+    return heights[iz * (SEG + 1) + ix];
+  };
+
+  const riverY = new Float32Array(riverSamples.length);
+  for (let i = 0; i < riverSamples.length; i++) {
+    riverY[i] = sampleH(riverSamples[i].x, riverSamples[i].z) - 1.0;
+  }
+  for (let pass = 0; pass < 16; pass++) {
+    for (let i = 1; i < riverY.length - 1; i++) {
+      riverY[i] = (riverY[i - 1] + riverY[i] * 2 + riverY[i + 1]) / 4;
+    }
+  }
+
+  const RIVER_INFLUENCE = 80, RIVER_DEPTH = 4.0;
+  const riverMask = new Float32Array(N);
+
+  for (let i = 0; i < N; i++) {
+    const x = posAttr.getX(i), z = posAttr.getZ(i);
+    let bestD2 = Infinity, bestIdx = 0;
+    for (let k = 0; k < riverSamples.length; k++) {
+      const dx = x - riverSamples[k].x, dz = z - riverSamples[k].z;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < bestD2) { bestD2 = d2; bestIdx = k; }
+    }
+    const d = Math.sqrt(bestD2);
+    if (d < RIVER_INFLUENCE) {
+      const t = d / RIVER_INFLUENCE;
+      const blend = 1 - smoothstep(0, 1, Math.pow(t, 0.7));
+      const bedY = riverY[bestIdx] - RIVER_DEPTH;
+      if (heights[i] > bedY) heights[i] = heights[i] * (1 - blend) + bedY * blend;
+      riverMask[i] = blend;
+    }
+  }
+
+  for (let i = 0; i < N; i++) posAttr.setY(i, heights[i]);
+  geo.computeVertexNormals();
+
+  const colors = new Float32Array(N * 3);
+  const normals = geo.attributes.normal;
+
+  for (let i = 0; i < N; i++) {
+    const x = posAttr.getX(i), h = posAttr.getY(i), z = posAttr.getZ(i);
+    const ny = normals.getY(i);
+    const slope = Math.max(0, 1 - ny);
+    const c = terrainColor(h, slope, x, z, noise);
+    if (riverMask[i] > 0.3) {
+      const sand = new THREE.Color(0.62, 0.56, 0.40);
+      c.lerp(sand, Math.min(1, (riverMask[i] - 0.3) * 1.2));
+    }
+    colors[i * 3] = c.r; colors[i * 3 + 1] = c.g; colors[i * 3 + 2] = c.b;
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+  const terrain = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
+    vertexColors: true,
+    roughness: 0.86,
+    metalness: 0.0,
+    envMapIntensity: 0.55,
+  }));
+  terrain.receiveShadow = true;
+
+  const wPositions = [], wUvs = [], wIndices = [];
+  for (let i = 0; i < riverSamples.length; i++) {
+    const t = i / (riverSamples.length - 1);
+    const p = riverSamples[i];
+    const pNext = riverSamples[Math.min(i + 1, riverSamples.length - 1)];
+    const pPrev = riverSamples[Math.max(i - 1, 0)];
+    const tx = pNext.x - pPrev.x, tz = pNext.z - pPrev.z;
+    const len = Math.hypot(tx, tz) || 1;
+    const nx = -tz / len, nz = tx / len;
+    const w = 30 * (0.55 + 0.45 * Math.sin(t * Math.PI + 0.3));
+    wPositions.push(p.x + nx * w, riverY[i] + 0.12, p.z + nz * w);
+    wPositions.push(p.x - nx * w, riverY[i] + 0.12, p.z - nz * w);
+    wUvs.push(0, t * 50); wUvs.push(1, t * 50);
+  }
+  for (let i = 0; i < riverSamples.length - 1; i++) {
+    const a = i * 2, b = a + 1, c = a + 2, d = a + 3;
+    wIndices.push(a, c, b, b, c, d);
+  }
+  const wGeo = new THREE.BufferGeometry();
+  wGeo.setAttribute('position', new THREE.Float32BufferAttribute(wPositions, 3));
+  wGeo.setAttribute('uv', new THREE.Float32BufferAttribute(wUvs, 2));
+  wGeo.setIndex(wIndices);
+  wGeo.computeVertexNormals();
+
+  const water = new THREE.Mesh(wGeo, new THREE.MeshStandardMaterial({
+    color: 0x1f5fa0, metalness: 0.30, roughness: 0.12,
+    envMapIntensity: 1.1, transparent: true, opacity: 0.95,
+  }));
+
+  return { terrain, water };
+}
+
+function terrainColor(h, slope, x, z, noise) {
+  const c = new THREE.Color();
+  const hRel = h + 230;
+
+  // 更饱和、更翠绿的分层
+  if (hRel < 10) {
+    c.setRGB(0.14, 0.34, 0.09);
+  } else if (hRel < 55) {
+    const t = (hRel - 10) / 45;
+    c.setRGB(0.14 + t * 0.14, 0.34 + t * 0.16, 0.09 + t * 0.08);
+  } else if (hRel < 130) {
+    const t = (hRel - 55) / 75;
+    c.setRGB(0.28 + t * 0.12, 0.50 + t * 0.08, 0.17 + t * 0.06);
+  } else if (hRel < 260) {
+    const t = (hRel - 130) / 130;
+    c.setRGB(0.40 - t * 0.04, 0.58 - t * 0.08, 0.23 + t * 0.10);
+  } else if (hRel < 480) {
+    const t = (hRel - 260) / 220;
+    c.setRGB(0.36 + t * 0.16, 0.50 + t * 0.14, 0.33 + t * 0.10);
+  } else {
+    const t = Math.min(1, (hRel - 480) / 240);
+    c.setRGB(0.52 + t * 0.42, 0.64 + t * 0.32, 0.43 + t * 0.50);
+  }
+
+  const rockAmt = smoothstep(0.38, 0.72, slope);
+  if (rockAmt > 0) {
+    c.lerp(new THREE.Color(0.42, 0.36, 0.30), rockAmt * 0.9);
+  }
+
+  const shade = fbm(noise, x * 0.00035 + 1000, z * 0.00035 + 1000, 2) * 0.5 + 0.5;
+  c.multiplyScalar(0.92 + shade * 0.10);
+
+  return c;
+}
+
+/* =====================================================================
+   蓝色 V 型领带（更饱和的蓝）
+   ===================================================================== */
+function createBlueRibbon() {
+  const body = new THREE.Group();
+  const S = 1.5 / 23.05, CX = 55.70, CY = 98.55;
+  const sx = (x) => (x - CX) * S, sy = (y) => (CY - y) * S;
+
+  const svgToShape = (d) => {
+    const shape = new THREE.Shape(), t = d.match(/[MLCZ]|-?\d+(?:\.\d+)?/gi) || [];
+    let i = 0, cmd = '';
+    while (i < t.length) {
+      if (/^[MLCZ]$/i.test(t[i])) { if ((cmd = t[i++].toUpperCase()) === 'Z') shape.closePath(); continue; }
+      if (cmd === 'M') { shape.moveTo(sx(+t[i++]), sy(+t[i++])); cmd = 'L'; }
+      else if (cmd === 'L') shape.lineTo(sx(+t[i++]), sy(+t[i++]));
+      else if (cmd === 'C') shape.bezierCurveTo(sx(+t[i++]), sy(+t[i++]), sx(+t[i++]), sy(+t[i++]), sx(+t[i++]), sy(+t[i++]));
+    }
+    return shape;
+  };
+
+  const opt = { depth: 0.06, bevelEnabled: true, bevelThickness: 0.008, bevelSize: 0.008, bevelSegments: 2 };
+
+  const back = new THREE.Mesh(
+    new THREE.ExtrudeGeometry(svgToShape("M60.85 39.45 L79.75 39.45 L64.05 68.05 L48.05 68.05 Z"), opt),
+    new THREE.MeshPhysicalMaterial({
+      color: 0x0f56a8, roughness: 0.46, clearcoat: 0.20, clearcoatRoughness: 0.45,
+    })
+  );
+  back.position.z = -0.03;
+  back.castShadow = true; back.receiveShadow = true;
+
+  const front = new THREE.Mesh(
+    new THREE.ExtrudeGeometry(svgToShape("M30.45 39.45 L50.15 39.45 L63.05 68.05 L48.05 68.05 Z"), opt),
+    new THREE.MeshPhysicalMaterial({
+      color: 0x1288ff, roughness: 0.38, clearcoat: 0.32, clearcoatRoughness: 0.28,
+    })
+  );
+  front.position.z = 0.06;
+  front.castShadow = true; front.receiveShadow = true;
+
+  body.add(back, front);
+
+  const riserL = new THREE.Object3D(); riserL.position.set(sx(40.30), sy(39.45), 0.08);
+  const riserR = new THREE.Object3D(); riserR.position.set(sx(70.30), sy(39.45), -0.02);
+  body.add(riserL, riserR);
+
+  return { group: body, riserL, riserR, bottomY: sy(68.05) };
+}
+
+/* =====================================================================
+   osu! SVG 纹理
+   ===================================================================== */
+const OSU_SVG = `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="25 25 300 300"><style>.st1{opacity:.15}.st3{fill:#f1f1f2}.st4{fill:#231f20}.st5{fill:#808184}.st8{fill:#59595c}.st9{fill:#a7a8ab}.st10{fill:#6d6e70}.st11{fill:#221f1f}.st12{fill:#404041}.st13{fill:#58595b}.st14{fill:#bbbdbf}.st15{fill:#fff}.st16{fill:#a6a8ab}</style><circle cx="175" cy="175" r="143.7" fill="#f6a"/><g class="st1" id="Triangles"><defs><circle id="a" class="st1" cx="175" cy="175" r="150"/></defs><clipPath id="b"><use xlink:href="#a" overflow="visible"/></clipPath><g clip-path="url(#b)"><path class="st3" d="M-81.2 336.9 175-106.9l256.2 443.8z"/><path class="st4" d="M68.8 443.7 325 0l256.2 443.7z"/><path class="st5" d="m-409.8 363.4 256.2-443.7 256.2 443.7z"/><path d="m61.4 158.2 256.2-443.8 256.2 443.8z" fill="#929497"/><path d="M-222.4 380 33.8-63.7 290 380z" fill="#636466"/><path class="st8" d="m-100.1 646.9 256.2-443.8 256.2 443.8z"/><path class="st9" d="m-164.9 147.2 97.3-168.5 97.3 168.5zm81.5 376.6 97.3-168.5 97.3 168.5z"/><path class="st10" d="m134.3 220.8 97.3-168.5 97.3 168.5z"/><path class="st9" d="M298.7 485.7 396 317.2l97.2 168.5z"/><path class="st8" d="m108.4 621.4 48.6-84.2 48.7 84.2z"/><path class="st11" d="m278.7 305.9 48.6-84.2 48.6 84.2zM46.2 400l97.3-168.5L240.8 400z"/><path class="st5" d="M108.8-86.6 36.5 38.6h194.6L158.8-86.6zm213.2 0-23.6 40.9h97.3L372-86.6z"/><path class="st12" d="M35.3 332.5 132.6 164l97.3 168.5z"/><path class="st5" d="m236.1 369.2 97.2-168.5 97.3 168.5z"/><path class="st8" d="m-51.9 428.8 48.1-83.3 48.1 83.3z"/><path class="st13" d="m123.2 104.8 48.1-83.3 48.1 83.3z"/><path class="st11" d="m283 90.2 48.1-83.3 48.1 83.3z"/><path class="st5" d="m-61.9 331.6 24.1-41.7 24 41.7z"/><path class="st8" d="m132.5 621.6 24-41.7 24.1 41.7zm84.2-156 24-41.7 24 41.7z"/><path class="st12" d="m197.1 259.7 48.1-83.3 48.1 83.3z"/><path class="st3" d="m283 239.3 48.1-83.3 48.1 83.3z"/><path class="st9" d="M-49.5 78.8-1.4-4.5l48.1 83.3zm-48.4 146.6 48.1-83.3 48.1 83.3z"/><path class="st5" d="m288.2-20 24-41.6L336.3-20z"/><path class="st14" d="m187.2 116.2 24.1-41.6 24 41.6z"/><path class="st15" d="m231.9 63.8 6.4-11 6.4 11z"/><path class="st10" d="M28.9 117.8 77 34.5l48.1 83.3z"/><path class="st16" d="m110.8 331.9 48.1-83.3 48.1 83.3z"/><path class="st4" d="m107 263.1 18.1-31.4 18 31.4z"/><path class="st9" d="m214 285.3 24-41.7 24.1 41.7zm-5.4-118.1 24-41.6 24.1 41.6z"/><path class="st3" d="m226 102.8 48.1-83.3 48 83.3z"/><path class="st16" d="m1.2 143.6 48.1-83.3 48.1 83.3z"/><path class="st8" d="m14 272.2 18.3-31.8 18.3 31.8z"/><path class="st16" d="m265.4 230.6 18.3-31.8 18.3 31.8z"/><path class="st15" d="M156.7 84.8 175 53.1l18.3 31.7z"/><path class="st13" d="m156.7 282.1 18.3-31.8 18.3 31.8z"/><path class="st8" d="m-19.7 88 18.3-31.8L17 88zm258.1 272.2 18.3-31.7 18.3 31.7z"/><path class="st5" d="m307.5 135.6 18.3-31.8 18.3 31.8z"/><path class="st14" d="m45.3 233.1 18.3-31.8L82 233.1z"/><path class="st3" d="m72.3 295.1 18.3-31.8 18.4 31.8zM27.6 167.7 46 136l18.3 31.7z"/><path class="st8" d="m113.7 123.7 9.1-15.8 9.2 15.8z"/><path class="st14" d="m50.8 152.9 9.1-15.8 9.2 15.8z"/><path d="m107.7 84.4 9.2-15.9 9.2 15.9z" fill="#e6e7e8"/><path class="st11" d="m69 360.2 18.3-31.7 18.3 31.7z"/><path class="st8" d="m112.2 419.2 18.3-31.8 18.3 31.8zm404.5-131.1 18.4-31.8 18.3 31.8z"/><path class="st5" d="M187.7 61.9 206 30.1l18.4 31.8z"/><path class="st15" d="m283.4 128.2 18.3-31.7 18.3 31.7z"/><path class="st8" d="m316.6 622.1 9.2-15.9 9.2 15.9z"/><path class="st9" d="m262.4 411.2 9.2-15.8 9.1 15.8z"/><path class="st8" d="m577.5 394.4 9.2-15.9 9.2 15.9z"/><path class="st5" d="m-97.4 339.9 18.3-31.7 18.4 31.7zm375.1-24.4 18.4-31.8 18.3 31.8z"/><path class="st9" d="m286.9 268.6 9.2-15.9 9.1 15.9z"/><path d="m210.1 128.5 10.9-18.9 10.9 18.9z" fill="#d0d2d3"/><path class="st5" d="M94.9-41.1 104-57l9.2 15.9z"/><path class="st8" d="M386.7 121.9 405 90.2l18.4 31.7zM463 336.8l9.2-15.9 9.2 15.9z"/></g></g><path class="st15" d="M100.1 206.4c-4.7 0-8.8-.8-12.3-2.3-3.5-1.5-6.4-3.7-8.6-6.4-2.3-2.7-4-5.9-5.2-9.6-1.2-3.7-1.7-7.6-1.7-11.9 0-4.3.6-8.3 1.7-12 1.2-3.7 2.9-7 5.2-9.7 2.3-2.7 5.2-4.9 8.6-6.5 3.5-1.6 7.6-2.4 12.3-2.4s8.8.8 12.3 2.4c3.5 1.6 6.4 3.7 8.8 6.5 2.3 2.7 4 6 5.2 9.7 1.1 3.7 1.7 7.7 1.7 12s-.6 8.2-1.7 11.9c-1.1 3.7-2.8 6.9-5.2 9.6-2.3 2.7-5.2 4.9-8.8 6.4-3.4 1.6-7.6 2.3-12.3 2.3zm0-12.1c4.2 0 7.2-1.6 9-4.7 1.8-3.1 2.7-7.6 2.7-13.4 0-5.8-.9-10.3-2.7-13.4-1.8-3.1-4.8-4.7-9-4.7-4.1 0-7.1 1.6-8.9 4.7-1.8 3.1-2.8 7.6-2.8 13.4 0 5.8.9 10.3 2.8 13.4 1.8 3.2 4.8 4.7 8.9 4.7zm51.8-14.5c-4.2-1.2-7.5-3-9.8-5.3-2.4-2.4-3.5-5.9-3.5-10.6 0-5.7 2-10.1 6.1-13.4 4.1-3.2 9.6-4.8 16.7-4.8a49.13 49.13 0 0 1 17.2 3.2c-.2 1.9-.5 4-1.1 6.1-.6 2.1-1.3 3.9-2.1 5.5-1.8-.7-3.8-1.4-5.9-2-2.2-.6-4.5-.8-6.8-.8-2.5 0-4.5.4-5.9 1.2-1.4.8-2.1 2-2.1 3.8 0 1.6.5 2.8 1.5 3.5 1 .7 2.4 1.3 4.3 1.9l6.4 1.9c2.1.6 4 1.3 5.7 2.2 1.7.9 3.1 1.9 4.3 3.2 1.2 1.3 2.1 2.8 2.8 4.7.7 1.9 1 4.2 1 6.8 0 2.8-.6 5.3-1.7 7.7a17.6 17.6 0 0 1-5 6.2c-2.2 1.8-4.9 3.1-8 4.2a35 35 0 0 1-10.7 1.5c-1.8 0-3.4-.1-4.9-.2-1.5-.1-2.9-.3-4.3-.6s-2.7-.6-4.1-1c-1.3-.4-2.8-.9-4.4-1.5.1-2 .5-4.1 1.1-6.1.6-2.1 1.3-4.1 2.2-6 2.5 1 4.8 1.7 7 2.2 2.2.5 4.5.7 6.9.7 1 0 2.2-.1 3.4-.3 1.2-.2 2.4-.5 3.4-1s1.9-1.1 2.6-1.9c.7-.8 1.1-1.8 1.1-3.1 0-1.8-.5-3.1-1.6-3.9-1.1-.8-2.6-1.5-4.5-2.1l-7.3-1.9zm39.3-32.7c2.7-.4 5.3-.7 8-.7 2.6 0 5.3.2 8 .7v30.7c0 3.1.2 5.6.7 7.6.5 2 1.2 3.6 2.2 4.7 1 1.2 2.3 2 3.8 2.5s3.3.7 5.3.7c2.8 0 5.1-.3 7-.8v-45.4c2.7-.4 5.3-.7 7.9-.7 2.6 0 5.3.2 8 .7v55.8c-2.4.8-5.6 1.6-9.5 2.4a65.33 65.33 0 0 1-23.3.3c-3.5-.6-6.6-1.9-9.3-3.8-2.7-1.9-4.8-4.8-6.3-8.5-1.6-3.7-2.4-8.7-2.4-14.9v-31.3zm65.9 58c-.4-2.8-.7-5.5-.7-8.2 0-2.7.2-5.5.7-8.3 2.8-.4 5.5-.7 8.2-.7 2.7 0 5.5.2 8.3.7.4 2.8.7 5.6.7 8.2 0 2.8-.2 5.5-.7 8.3-2.8.4-5.6.7-8.2.7-2.8-.1-5.5-.3-8.3-.7zm-.4-80.7c2.9-.4 5.8-.7 8.6-.7 2.9 0 5.8.2 8.8.7l-1.1 54.9c-2.6.4-5.1.7-7.5.7-2.5 0-5.1-.2-7.6-.7l-1.2-54.9z"/><path class="st15" d="M175 25C92.2 25 25 92.2 25 175s67.2 150 150 150 150-67.2 150-150S257.8 25 175 25zm0 285c-74.6 0-135-60.4-135-135S100.4 40 175 40s135 60.4 135 135-60.4 135-135 135z"/></svg>`;
+
+function loadSvgTexture(svgString, size = 1024) {
+  return new Promise((resolve) => {
+    const s = svgString.replace(/<svg\s/, `<svg width="${size}" height="${size}" `);
+    const blob = new Blob([s], { type: 'image/svg+xml;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => {
+      const cv = document.createElement('canvas');
+      cv.width = cv.height = size;
+      const ctx = cv.getContext('2d');
+      ctx.clearRect(0, 0, size, size);
+      ctx.drawImage(img, 0, 0, size, size);
+      URL.revokeObjectURL(url);
+      const tex = new THREE.CanvasTexture(cv);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.anisotropy = 8;
+      resolve(tex);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
+    img.src = url;
+  });
+}
+
+/* =====================================================================
+   osu! 3D 挂坠
+   ===================================================================== */
+function createOsuLogo() {
+  const group = new THREE.Group();
+  const R = 2.6;
+  const S = R / 150;
+
+  const base = new THREE.Mesh(
+    new THREE.CylinderGeometry(150 * S, 150 * S, 0.16, 96),
+    new THREE.MeshPhysicalMaterial({
+      color: 0xffffff, roughness: 0.20, metalness: 0.04,
+      clearcoat: 0.75, clearcoatRoughness: 0.14, envMapIntensity: 0.95,
+    })
+  );
+  base.rotation.x = Math.PI / 2;
+  base.castShadow = true; base.receiveShadow = true;
+  group.add(base);
+
+  const faceMat = new THREE.MeshPhysicalMaterial({
+    color: 0xff44a0, roughness: 0.30, metalness: 0.03,
+    clearcoat: 0.25, clearcoatRoughness: 0.35, envMapIntensity: 0.95,
+  });
+
+  const faceGeo = new THREE.CircleGeometry(150 * S * 0.995, 96);
+  const face = new THREE.Mesh(faceGeo, faceMat);
+  face.position.z = 0.085;
+  face.castShadow = true; face.receiveShadow = true;
+  group.add(face);
+
+  const faceB = new THREE.Mesh(faceGeo, faceMat);
+  faceB.position.z = -0.085;
+  faceB.rotation.y = Math.PI;
+  group.add(faceB);
+
+  loadSvgTexture(OSU_SVG, 1024).then((tex) => {
+    if (!tex) return;
+    faceMat.map = tex;
+    faceMat.bumpMap = tex;
+    faceMat.bumpScale = 0.008;
+    faceMat.color.set(0xffffff);
+    faceMat.needsUpdate = true;
+  });
+
+  return { group, radius: R };
+}
+
+/* =====================================================================
+   7 气室冲压翼伞（顶点色更饱和，弱化 sheen 白感）
+   ===================================================================== */
+function createRamAirParachute() {
+  const group = new THREE.Group();
+  const COLORS = ['#FFC700', '#FF352B', '#34C759', '#0A84FF', '#34C759', '#FF352B', '#FFC700'].map(c => new THREE.Color(c));
+  const CELLS = 7, NU = 12, NV = 18, INSET = 0.225;
+  const verts = [], cols = [], idx = [];
+
+  const addV = (u, v, w, inset, c, m = 1) => {
+    verts.push({ u, v, w, inset });
+    cols.push(c.r * m, c.g * m, c.b * m);
+    return verts.length - 1;
+  };
+  const addQ = (a, b, c, d) => idx.push(a, b, d, b, c, d);
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const sm = (e0, e1, x) => { const t = Math.max(0, Math.min(1, (x - e0) / (e1 - e0))); return t * t * (3 - 2 * t); };
+
+  for (let c = 0; c < CELLS; c++) {
+    const col = COLORS[c], u0 = c / CELLS, u1 = (c + 1) / CELLS, top = [], bot = [];
+    for (let iu = 0; iu <= NU; iu++) {
+      const u = lerp(u0, u1, iu / NU), tR = [], bR = [];
+      for (let iv = 0; iv <= NV; iv++) {
+        tR.push(addV(u, iv / NV, 1, 0, col, 0.98 + 0.02 * sm(0, 0.15, Math.min(iu, NU - iu) / NU)));
+        bR.push(addV(u, iv / NV, 0, 0, col, 0.86));
+      }
+      top.push(tR); bot.push(bR);
+    }
+    for (let iu = 0; iu < NU; iu++) {
+      for (let iv = 0; iv < NV; iv++) {
+        addQ(top[iu][iv], top[iu + 1][iv], top[iu + 1][iv + 1], top[iu][iv + 1]);
+        addQ(bot[iu + 1][iv], bot[iu][iv], bot[iu][iv + 1], bot[iu + 1][iv + 1]);
+      }
+      const uA = lerp(u0, u1, iu / NU), uB = lerp(u0, u1, (iu + 1) / NU);
+      addQ(addV(uA, 0, 1, 0, col, 0.90), addV(uA, 0, 0, 0, col, 0.82), addV(uB, 0, 0, 0, col, 0.82), addV(uB, 0, 1, 0, col, 0.90));
+      addQ(addV(uA, 1, 1, 0, col, 0.82), addV(uB, 1, 1, 0, col, 0.82), addV(uB, 1, 1, INSET, col, 0.55), addV(uA, 1, 1, INSET, col, 0.55));
+      addQ(addV(uB, 1, 0, 0, col, 0.78), addV(uA, 1, 0, 0, col, 0.78), addV(uA, 1, 0, INSET, col, 0.50), addV(uB, 1, 0, INSET, col, 0.50));
+      addQ(addV(uA, 1, 1, INSET, col, 0.48), addV(uB, 1, 1, INSET, col, 0.48), addV(uB, 1, 0, INSET, col, 0.44), addV(uA, 1, 0, INSET, col, 0.44));
+    }
+  }
+
+  const wingGeo = new THREE.BufferGeometry();
+  const posArr = new Float32Array(verts.length * 3);
+  const posAttr = new THREE.BufferAttribute(posArr, 3).setUsage(THREE.DynamicDrawUsage);
+  wingGeo.setAttribute('position', posAttr);
+  wingGeo.setAttribute('color', new THREE.Float32BufferAttribute(cols, 3));
+  wingGeo.setIndex(idx);
+
+  // 织物材质：低 sheen 避免泛白，低 envMapIntensity 避免环境反射冲淡颜色
+  const wingMesh = new THREE.Mesh(wingGeo, new THREE.MeshPhysicalMaterial({
+    vertexColors: true,
+    roughness: 0.62,
+    metalness: 0.0,
+    clearcoat: 0.02,
+    clearcoatRoughness: 0.7,
+    sheen: 0.22,
+    sheenRoughness: 0.7,
+    sheenColor: new THREE.Color(0xffd89a),
+    side: THREE.DoubleSide,
+    envMapIntensity: 0.65,
+  }));
+  wingMesh.castShadow = true;
+  wingMesh.receiveShadow = true;
+  group.add(wingMesh);
+
+  const CHORDS = [0.10, 0.50, 0.92], SEGS = 10, COSH = Math.cosh(1.7);
+  const lineArr = new Float32Array(24 * SEGS * 2 * 3);
+  const lineAttr = new THREE.BufferAttribute(lineArr, 3).setUsage(THREE.DynamicDrawUsage);
+  const lineGeo = new THREE.BufferGeometry().setAttribute('position', lineAttr);
+  group.add(new THREE.LineSegments(lineGeo, new THREE.LineBasicMaterial({
+    color: 0xf4f7fb, transparent: true, opacity: 0.9,
+  })));
+
+  const evalPt = (u, v, w, inset, time, out = new THREE.Vector3()) => {
+    const th = (u - 0.5) * 2.55;
+    const cell = Math.pow(Math.abs(Math.sin(u * 7 * Math.PI)), 0.7);
+    const cam = 0.45 * Math.sin(v * Math.PI);
+    const rip = 0.05 * Math.sin(11 * u + 2 * time) * Math.sin(v * Math.PI)
+              + 0.025 * Math.sin(7 * v - 2.6 * time + 3 * u);
+    const rOut = 6 + cam + 0.16 * cell + rip;
+    const rIn = lerp(rOut, 6 + 0.6 * cam + 0.05 * cell - 0.34 + rip, sm(0, 0.18, v));
+    const r = lerp(rIn, rOut, w);
+    return out.set(
+      Math.sin(th) * r,
+      4.4 + Math.cos(th) * r,
+      (v - 0.5) * 4.1 * (0.88 + 0.12 * Math.sin(u * Math.PI)) - 0.4 * Math.pow(2 * u - 1, 2) - inset
+    );
+  };
+
+  const _pt = new THREE.Vector3(), _rL = new THREE.Vector3(), _rR = new THREE.Vector3();
+
+  function update(time, riserL, riserR) {
+    for (let i = 0; i < verts.length; i++) {
+      evalPt(verts[i].u, verts[i].v, verts[i].w, verts[i].inset, time, _pt);
+      posArr[i * 3] = _pt.x; posArr[i * 3 + 1] = _pt.y; posArr[i * 3 + 2] = _pt.z;
+    }
+    posAttr.needsUpdate = true;
+    wingGeo.computeVertexNormals();
+    wingGeo.computeBoundingSphere();
+
+    _rL.setFromMatrixPosition(riserL.matrixWorld); group.worldToLocal(_rL);
+    _rR.setFromMatrixPosition(riserR.matrixWorld); group.worldToLocal(_rR);
+
+    let p = 0;
+    for (let g = 0; g < 8; g++) {
+      const u = g / 7, target = g < 4 ? _rL : _rR;
+      for (let ci = 0; ci < 3; ci++) {
+        evalPt(u, CHORDS[ci], 0, 0, time, _pt);
+        for (let s = 0; s < SEGS; s++) {
+          const s0 = s / SEGS, s1 = (s + 1) / SEGS;
+          const sag0 = -0.028 * (COSH - Math.cosh(1.7 * (2 * s0 - 1))) / (COSH - 1);
+          const sag1 = -0.028 * (COSH - Math.cosh(1.7 * (2 * s1 - 1))) / (COSH - 1);
+          lineArr[p++] = lerp(_pt.x, target.x, s0); lineArr[p++] = lerp(_pt.y, target.y, s0) + sag0; lineArr[p++] = lerp(_pt.z, target.z, s0);
+          lineArr[p++] = lerp(_pt.x, target.x, s1); lineArr[p++] = lerp(_pt.y, target.y, s1) + sag1; lineArr[p++] = lerp(_pt.z, target.z, s1);
+        }
+      }
+    }
+    lineAttr.needsUpdate = true;
+  }
+
+  return { group, update };
+}
+
+/* =====================================================================
+   场景初始化
+   ===================================================================== */
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+
+// 关键：改用线性色调映射，颜色不再被 ACES 压灰，饱和度高
+renderer.toneMapping = THREE.LinearToneMapping;
+renderer.toneMappingExposure = 0.92;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+// 雾极淡且颜色偏蓝，不会把画面冲白
+scene.fog = new THREE.FogExp2(0xa9d0ec, 0.000022);
+
+const START_Y = 2800;
+const STOP_Y = 260;
+
+const TARGET_LIFT = 2;
+const CAM_OFFSET = new THREE.Vector3(10, 8, 26);
+
+const camera = new THREE.PerspectiveCamera(48, window.innerWidth / window.innerHeight, 0.3, 30000);
+camera.position.set(0, START_Y, 0).add(CAM_OFFSET);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, START_Y + TARGET_LIFT, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.065;
+controls.minDistance = 6;
+controls.maxDistance = 300;
+controls.maxPolarAngle = Math.PI * 0.96;
+
+/* ---------- 天空穹顶（不受色调映射影响，保持饱和） ---------- */
+const skyTex = createSkyTexture(VISUAL_SUN_DIR);
+const skyMat = new THREE.MeshBasicMaterial({
+  map: skyTex,
+  side: THREE.BackSide,
+  depthWrite: false,
+  fog: false,
+  toneMapped: false,
+});
+const skyDome = new THREE.Mesh(new THREE.SphereGeometry(14000, 64, 40), skyMat);
+skyDome.renderOrder = -1;
+scene.add(skyDome);
+
+/* ---------- 环境贴图（HDR 太阳参与反射） ---------- */
+const pmrem = new THREE.PMREMGenerator(renderer);
+pmrem.compileEquirectangularShader();
+
+const envScene = new THREE.Scene();
+envScene.add(new THREE.Mesh(new THREE.SphereGeometry(500, 32, 24), skyMat.clone()));
+
+const hdrSun = new THREE.Mesh(
+  new THREE.SphereGeometry(40, 16, 12),
+  new THREE.MeshBasicMaterial({ color: new THREE.Color(8.0, 7.0, 5.4), fog: false })
+);
+hdrSun.position.copy(SUN_DIR).multiplyScalar(320);
+envScene.add(hdrSun);
+
+const envRT = pmrem.fromScene(envScene, 0.02, 1, 2000);
+scene.environment = envRT.texture;
+
+/* ---------- 视觉太阳 ---------- */
+const sunSprite = (() => {
+  const size = 512;
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = size;
+  const ctx = cv.getContext('2d');
+  const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+  g.addColorStop(0.00, 'rgba(255,255,252,1.0)');
+  g.addColorStop(0.05, 'rgba(255,253,238,1.0)');
+  g.addColorStop(0.14, 'rgba(255,248,205,0.75)');
+  g.addColorStop(0.32, 'rgba(255,240,170,0.30)');
+  g.addColorStop(0.60, 'rgba(255,232,145,0.08)');
+  g.addColorStop(1.00, 'rgba(255,225,125,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, size, size);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: tex, transparent: true, depthWrite: false,
+    blending: THREE.AdditiveBlending, fog: false, toneMapped: false,
+  }));
+  sp.scale.set(1400, 1400, 1);
+  return sp;
+})();
+scene.add(sunSprite);
+
+/* ---------- 光照（主光主导、补光收弱，强化对比与色彩） ---------- */
+const sunLight = new THREE.DirectionalLight(0xfff0d2, 2.1);
+sunLight.position.copy(SUN_DIR).multiplyScalar(6000);
+sunLight.castShadow = true;
+sunLight.shadow.mapSize.set(2048, 2048);
+sunLight.shadow.bias = -0.0004;
+sunLight.shadow.normalBias = 0.02;
+{
+  const sc = sunLight.shadow.camera;
+  sc.left = -18; sc.right = 18; sc.top = 18; sc.bottom = -18;
+  sc.near = 1; sc.far = 220;
+}
+scene.add(sunLight);
+scene.add(sunLight.target);
+
+// 半球光调弱，避免整体发白
+scene.add(new THREE.HemisphereLight(0x9ecbf2, 0x5a6b45, 0.40));
+
+// 轮廓光（略冷白，用于勾边）
+const rimLight = new THREE.DirectionalLight(0xffe6c4, 0.55);
+rimLight.position.set(-SUN_DIR.x * 4000, 1800, -SUN_DIR.z * 4000);
+scene.add(rimLight);
+
+// 冷色补光极弱
+const coolFill = new THREE.DirectionalLight(0xbcd9ff, 0.16);
+coolFill.position.set(2500, 700, -2500);
+scene.add(coolFill);
+
+/* ---------- 地形 + 河流 ---------- */
+const { terrain, water } = buildTerrainAndRiver();
+scene.add(terrain);
+scene.add(water);
+
+/* ---------- 伞 / 领带 / osu! 挂坠 ---------- */
+const parachute = createRamAirParachute();
+const ribbon = createBlueRibbon();
+
+const pendulum = new THREE.Group();
+pendulum.position.set(0, 3.84, 0);
+ribbon.group.position.set(0, -3.84, 0);
+pendulum.add(ribbon.group);
+
+const logoPivot = new THREE.Group();
+logoPivot.position.set(0, ribbon.bottomY, 0.02);
+const osuLogo = createOsuLogo();
+osuLogo.group.position.set(0, -osuLogo.radius * 0.985, 0);
+logoPivot.add(osuLogo.group);
+ribbon.group.add(logoPivot);
+
+parachute.group.add(pendulum);
+parachute.group.position.set(0, START_Y, 0);
+scene.add(parachute.group);
+
+/* =====================================================================
+   坠落状态
+   ===================================================================== */
+let falling = true;
+let velocity = 0;
+let fallTime = 0;
+
+const MAX_SPEED = 75;
+const ACCEL_TIME = 3.0;
+
+const FIXED_STEP = 1 / 120;
+let physicsAccumulator = 0;
+
+const prevParachutePos = new THREE.Vector3(0, START_Y, 0);
+const statusEl = document.getElementById('status');
+
+function resetAll() {
+  falling = true;
+  velocity = 0;
+  fallTime = 0;
+  physicsAccumulator = 0;
+
+  parachute.group.position.set(0, START_Y, 0);
+  parachute.group.rotation.set(0, 0, 0);
+  pendulum.rotation.set(0, 0, 0);
+  logoPivot.rotation.set(0, 0, 0);
+
+  prevParachutePos.set(0, START_Y, 0);
+
+  camera.position.copy(parachute.group.position).add(CAM_OFFSET);
+  controls.target.copy(parachute.group.position);
+  controls.target.y += TARGET_LIFT;
+  controls.update();
+
+  statusEl.textContent = `高度：${START_Y.toFixed(0)} m`;
+}
+
+document.getElementById('resetBtn').addEventListener('click', resetAll);
+
+/* =====================================================================
+   渲染循环
+   ===================================================================== */
+const clock = new THREE.Clock(false);
+let clockStarted = false;
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  if (!clockStarted) {
+    clock.start();
+    clockStarted = true;
+    controls.update();
+    renderer.render(scene, camera);
+    return;
+  }
+
+  const dt = Math.min(0.1, clock.getDelta());
+  const t = clock.getElapsedTime();
+
+  physicsAccumulator += dt;
+  physicsAccumulator = Math.min(physicsAccumulator, 0.1);
+  while (physicsAccumulator >= FIXED_STEP) {
+    if (falling) {
+      fallTime += FIXED_STEP;
+      const f = smoothstep(0, ACCEL_TIME, fallTime);
+      velocity = MAX_SPEED * f;
+      parachute.group.position.y -= velocity * FIXED_STEP;
+
+      parachute.group.position.x = 22 * Math.sin(fallTime * 0.42);
+      parachute.group.position.z = 15 * Math.cos(fallTime * 0.34);
+
+      const k = velocity / MAX_SPEED;
+      parachute.group.rotation.x = -0.03 - k * 0.06 + 0.02 * Math.sin(t * 1.05);
+      parachute.group.rotation.z = 0.025 * Math.sin(t * 0.75);
+
+      if (parachute.group.position.y <= STOP_Y) {
+        parachute.group.position.y = STOP_Y;
+        falling = false;
+        velocity = 0;
+      }
+    }
+    physicsAccumulator -= FIXED_STEP;
+  }
+
+  if (!falling) {
+    parachute.group.rotation.z = 0.02 * Math.sin(t * 0.9);
+    parachute.group.rotation.x = 0.03 * Math.sin(t * 0.7 + 0.5);
+  }
+
+  pendulum.rotation.z = 0.11 * Math.sin(t * 1.15);
+  pendulum.rotation.x = 0.055 * Math.sin(t * 0.82 + 1.2);
+
+  logoPivot.rotation.z = 0.05 * Math.sin(t * 1.38 + 0.7);
+  logoPivot.rotation.x = 0.035 * Math.sin(t * 1.02 + 1.9);
+
+  const delta = new THREE.Vector3().subVectors(parachute.group.position, prevParachutePos);
+  camera.position.add(delta);
+  controls.target.add(delta);
+  prevParachutePos.copy(parachute.group.position);
+
+  sunLight.position.copy(parachute.group.position).addScaledVector(SUN_DIR, 60);
+  sunLight.target.position.copy(parachute.group.position);
+  sunLight.target.updateMatrixWorld();
+
+  skyDome.position.copy(camera.position);
+  sunSprite.position.copy(camera.position).add(VISUAL_SUN_DIR.clone().multiplyScalar(10000));
+
+  scene.updateMatrixWorld(true);
+  parachute.update(t, ribbon.riserL, ribbon.riserR);
+
+  if (falling || parachute.group.position.y > STOP_Y + 1) {
+    statusEl.textContent = `高度：${parachute.group.position.y.toFixed(0)} m　速度：${(velocity * 0.36).toFixed(0)} km/h`;
+  } else {
+    statusEl.textContent = `已着陆　高度：${STOP_Y.toFixed(0)} m`;
+  }
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>
