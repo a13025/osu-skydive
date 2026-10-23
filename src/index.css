@@ -1,0 +1,23 @@
+@import "tailwindcss";
+
+html, body, #root {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #7db6e8;
+  font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+canvas {
+  display: block;
+}
+
+.hud-panel {
+  border-radius: 12px;
+  color: #eaf4ff;
+  background: rgba(10, 30, 60, 0.32);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow: 0 4px 18px rgba(0, 20, 50, 0.18);
+}
